@@ -1,5 +1,6 @@
 from pyspark import SparkContext, SparkConf
 import sys
+import os
 
 def main():
     """
@@ -27,9 +28,17 @@ def main():
     # ==========================================
     # INITIALIZE SPARK
     # ==========================================
-    conf = SparkConf().setAppName("PageRank")
-    sc = SparkContext(conf=conf)
-    sc.setLogLevel("ERROR")  # Reduce Spark logging verbosity
+    # Windows-friendly configuration
+    conf = SparkConf().setAppName("PageRank").setMaster("local[*]")
+    
+    # Suppress excessive logging
+    try:
+        sc = SparkContext(conf=conf)
+        sc.setLogLevel("ERROR")
+    except Exception as e:
+        print(f"Error initializing Spark: {e}")
+        print("If running on Windows, make sure HADOOP_HOME is set or use 'local[*]' mode")
+        sys.exit(1)
     
     print(f"📖 Reading input from: {INPUT_FILE}")
     print(f"📝 Output will be written to: {OUTPUT_FILE}")
@@ -40,7 +49,12 @@ def main():
     
     # Read edges from input file
     # Each line: "source destination"
-    lines = sc.textFile(INPUT_FILE)
+    try:
+        lines = sc.textFile(INPUT_FILE)
+    except Exception as e:
+        print(f"Error reading input file: {e}")
+        sc.stop()
+        sys.exit(1)
     
     # Parse edges: (source, destination)
     edges = lines.map(lambda line: tuple(line.strip().split())).cache()
@@ -153,9 +167,19 @@ def main():
     # Write to output file
     output_lines = [f"{vertex} {rank}" for vertex, rank in final_ranks_sorted]
     output_rdd = sc.parallelize(output_lines)
+    
+    # Remove output directory if it exists
+    import shutil
+    if os.path.exists(OUTPUT_FILE):
+        if os.path.isdir(OUTPUT_FILE):
+            shutil.rmtree(OUTPUT_FILE)
+        else:
+            os.remove(OUTPUT_FILE)
+    
     output_rdd.coalesce(1).saveAsTextFile(OUTPUT_FILE)
     
     print(f"\n💾 Results saved to: {OUTPUT_FILE}")
+    print(f"   (Output is in a directory - check {OUTPUT_FILE}/part-00000)")
     
     # Stop Spark context
     sc.stop()
