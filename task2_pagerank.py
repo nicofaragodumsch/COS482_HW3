@@ -55,6 +55,8 @@ def main():
     # Optional: Increase timeout settings to be more forgiving on slow starts
     conf.set("spark.network.timeout", "600s")
     conf.set("spark.executor.heartbeatInterval", "60s")
+
+    os.environ['HADOOP_HOME'] = "C:\\hadoop"
     
     sc = SparkContext(conf=conf)
     
