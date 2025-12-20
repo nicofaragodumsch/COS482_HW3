@@ -1,4 +1,15 @@
 import sys
+import os
+
+# ==========================================
+# WINDOWS FIX: Patch socketserver for PySpark
+# ==========================================
+import socketserver
+if sys.platform == "win32":
+    # On Windows, 'UnixStreamServer' doesn't exist.
+    # We map it to 'TCPServer' to satisfy PySpark's requirements.
+    socketserver.UnixStreamServer = socketserver.TCPServer
+
 from pyspark import SparkConf, SparkContext
 
 # ==========================================
@@ -28,8 +39,12 @@ def compute_contributions(node_data):
 
 def main():
     # Initialize Spark
-    conf = SparkConf().setAppName("Task2_PageRank")
+    # We use 'local[*]' to run on all available cores on your machine
+    conf = SparkConf().setAppName("Task2_PageRank").setMaster("local[*]")
     sc = SparkContext(conf=conf)
+    
+    # Set log level to ERROR to reduce console noise
+    sc.setLogLevel("ERROR")
 
     # 1. Load Data
     lines = sc.textFile(INPUT_FILE)
@@ -97,7 +112,8 @@ def main():
 
     # 8. Output results
     # Format: "vertex_id <rank>"
-    # coalese(1) allows us to save as a single part file for easier reading (optional optimization)
+    # coalese(1) allows us to save as a single part file for easier reading
+    # If output dir exists, we can't overwrite easily in standard Spark, so ensure clean dir.
     final_ranks.map(lambda x: f"{x[0]} {x[1]}") \
                .coalesce(1) \
                .saveAsTextFile(OUTPUT_DIR)
