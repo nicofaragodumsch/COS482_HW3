@@ -26,18 +26,21 @@ def main():
         OUTPUT_FILE = sys.argv[2]
     
     # ==========================================
-    # INITIALIZE SPARK
+    # INITIALIZE SPARK (Windows-optimized)
     # ==========================================
-    # Windows-friendly configuration
-    conf = SparkConf().setAppName("PageRank").setMaster("local[*]")
+    conf = (SparkConf()
+            .setAppName("PageRank")
+            .setMaster("local[1]")  # Use only 1 thread to avoid connection issues
+            .set("spark.driver.host", "localhost")
+            .set("spark.driver.bindAddress", "127.0.0.1")
+            .set("spark.ui.enabled", "false")  # Disable UI
+            .set("spark.sql.shuffle.partitions", "1"))  # Minimal shuffling
     
-    # Suppress excessive logging
     try:
         sc = SparkContext(conf=conf)
         sc.setLogLevel("ERROR")
     except Exception as e:
         print(f"Error initializing Spark: {e}")
-        print("If running on Windows, make sure HADOOP_HOME is set or use 'local[*]' mode")
         sys.exit(1)
     
     print(f"📖 Reading input from: {INPUT_FILE}")
@@ -47,8 +50,6 @@ def main():
     # STEP 0: READ INPUT AND BUILD GRAPH
     # ==========================================
     
-    # Read edges from input file
-    # Each line: "source destination"
     try:
         lines = sc.textFile(INPUT_FILE)
     except Exception as e:
@@ -56,52 +57,43 @@ def main():
         sc.stop()
         sys.exit(1)
     
-    # Parse edges: (source, destination)
-    edges = lines.map(lambda line: tuple(line.strip().split())).cache()
+    # Parse edges: (source, destination) - NO CACHE to avoid serialization issues
+    edges = lines.map(lambda line: tuple(line.strip().split()))
     
-    # Get all unique vertices
-    sources = edges.map(lambda edge: edge[0])
-    destinations = edges.map(lambda edge: edge[1])
-    all_vertices = sources.union(destinations).distinct().collect()
-    all_vertices_set = set(all_vertices)
-    num_vertices = len(all_vertices_set)
+    # Get all unique vertices - collect early to avoid issues
+    edges_list = edges.collect()  # Collect to driver to avoid Java communication issues
+    
+    all_vertices_set = set()
+    for src, dst in edges_list:
+        all_vertices_set.add(src)
+        all_vertices_set.add(dst)
+    
+    all_vertices = sorted(list(all_vertices_set))
+    num_vertices = len(all_vertices)
     
     print(f"🔢 Total vertices in graph: {num_vertices}")
-    print(f"   Vertices: {sorted(all_vertices)}")
+    print(f"   Vertices: {all_vertices}")
     
-    # Build adjacency list: (vertex, [list of neighbors])
-    # Group edges by source vertex
-    adjacency_list = edges.groupByKey().mapValues(list)
+    # Build adjacency list in Python (not Spark) to avoid issues
+    adjacency_dict = {v: [] for v in all_vertices}
+    for src, dst in edges_list:
+        adjacency_dict[src].append(dst)
     
-    # For vertices with no outgoing edges, we need to add edges to all OTHER vertices
-    # First, find vertices with no outgoing edges
-    vertices_with_edges = adjacency_list.keys().collect()
-    vertices_with_no_edges = all_vertices_set - set(vertices_with_edges)
+    # For vertices with no outgoing edges, add edges to all OTHER vertices
+    vertices_with_no_edges = [v for v in all_vertices if len(adjacency_dict[v]) == 0]
     
-    print(f"🔍 Vertices with no outgoing edges: {sorted(vertices_with_no_edges)}")
+    print(f"🔍 Vertices with no outgoing edges: {vertices_with_no_edges}")
     
-    # For each vertex with no outgoing edges, add edges to all other vertices
-    if vertices_with_no_edges:
-        # Create edges to all other vertices (excluding the vertex itself)
-        no_edge_vertices_rdd = sc.parallelize([
-            (vertex, [v for v in all_vertices if v != vertex])
-            for vertex in vertices_with_no_edges
-        ])
-        # Union with existing adjacency list
-        adjacency_list = adjacency_list.union(no_edge_vertices_rdd)
+    for vertex in vertices_with_no_edges:
+        adjacency_dict[vertex] = [v for v in all_vertices if v != vertex]
     
-    # Ensure all vertices are in the adjacency list (even isolated ones)
-    # Create RDD with empty lists for any missing vertices
-    all_vertices_rdd = sc.parallelize([(v, []) for v in all_vertices])
-    adjacency_list = adjacency_list.union(all_vertices_rdd).reduceByKey(lambda a, b: a if a else b)
-    
-    adjacency_list = adjacency_list.cache()
+    # Convert back to RDD
+    adjacency_list = sc.parallelize(list(adjacency_dict.items()))
     
     # ==========================================
     # STEP 1: INITIALIZE PAGE RANKS
     # ==========================================
     
-    # Initialize all page ranks to 1.0
     ranks = sc.parallelize([(vertex, 1.0) for vertex in all_vertices])
     
     print(f"\n🚀 Starting PageRank algorithm with {NUM_ITERATIONS} iterations...")
@@ -111,36 +103,23 @@ def main():
     # ==========================================
     
     for iteration in range(NUM_ITERATIONS):
-        # Step 2: Calculate contributions
-        # Each vertex contributes rank(v) / |neighbors(v)| to each of its neighbors
-        
-        # Join ranks with adjacency list to get (vertex, (rank, [neighbors]))
+        # Join ranks with adjacency list
         ranks_with_neighbors = adjacency_list.join(ranks)
         
-        # Calculate contributions: 
-        # For each vertex, emit (neighbor, contribution) for each neighbor
-        # Also emit (vertex, self_contribution) for staying on the page
+        # Calculate contributions
         contributions = ranks_with_neighbors.flatMap(
             lambda vertex_data: compute_contributions(vertex_data, num_vertices)
         )
         
-        # Step 3: Aggregate contributions and update ranks
-        # Sum all contributions for each vertex
-        # Formula: 0.15 + 0.85 × (sum of contributions from incoming edges)
-        
-        # Group contributions by vertex and sum them
+        # Sum contributions
         summed_contributions = contributions.reduceByKey(lambda a, b: a + b)
         
-        # Update ranks using the formula
-        # Note: The 0.15 already includes the random teleport (0.10) and 
-        # self-loop contribution (0.05) as per the algorithm description
+        # Update ranks
         ranks = summed_contributions.mapValues(lambda contrib: 0.15 + 0.85 * contrib)
         
-        # Ensure all vertices have a rank (in case some have no incoming contributions)
+        # Ensure all vertices have ranks
         all_vertices_with_base = sc.parallelize([(v, 0.15) for v in all_vertices])
         ranks = ranks.union(all_vertices_with_base).reduceByKey(lambda a, b: a if a != 0.15 else b)
-        
-        ranks = ranks.cache()
         
         if (iteration + 1) % 5 == 0:
             print(f"   Iteration {iteration + 1}/{NUM_ITERATIONS} complete")
@@ -149,11 +128,10 @@ def main():
     # STEP 5: NORMALIZE BY TOTAL NUMBER OF VERTICES
     # ==========================================
     
-    # Divide each rank by the total number of vertices
     final_ranks = ranks.mapValues(lambda rank: rank / num_vertices)
     
-    # Sort by vertex for consistent output
-    final_ranks_sorted = final_ranks.sortByKey().collect()
+    # Collect results to driver
+    final_ranks_sorted = sorted(final_ranks.collect(), key=lambda x: x[0])
     
     # ==========================================
     # OUTPUT RESULTS
@@ -166,7 +144,7 @@ def main():
     
     # Write to output file
     output_lines = [f"{vertex} {rank}" for vertex, rank in final_ranks_sorted]
-    output_rdd = sc.parallelize(output_lines)
+    output_rdd = sc.parallelize(output_lines, 1)  # Single partition
     
     # Remove output directory if it exists
     import shutil
@@ -176,7 +154,7 @@ def main():
         else:
             os.remove(OUTPUT_FILE)
     
-    output_rdd.coalesce(1).saveAsTextFile(OUTPUT_FILE)
+    output_rdd.saveAsTextFile(OUTPUT_FILE)
     
     print(f"\n💾 Results saved to: {OUTPUT_FILE}")
     print(f"   (Output is in a directory - check {OUTPUT_FILE}/part-00000)")
@@ -215,8 +193,6 @@ def compute_contributions(vertex_data, num_vertices):
         contribution_per_neighbor = (0.85 * rank) / num_neighbors
         for neighbor in neighbors:
             contributions.append((neighbor, contribution_per_neighbor))
-    # Note: If no neighbors exist, those edges were already added to all other vertices
-    # in the adjacency list construction step
     
     # Contribution 3: Random teleport (10% of ALL ranks distributed to ALL vertices)
     # This is handled implicitly in the rank update formula:
