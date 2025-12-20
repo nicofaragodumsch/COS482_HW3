@@ -180,5 +180,6 @@ def main():
     else:
         print(f"Movie '{query_name}' not found.")
 
+
 if __name__ == "__main__":
     main()

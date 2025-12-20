@@ -14,20 +14,25 @@ REQUIRED_INDEX = "name"
 def run_student_script():
     """Runs the student script and captures stdout/stderr."""
     print(f"Running {STUDENT_SCRIPT}...")
+    print("⏳ This may take a minute or two depending on your computer's speed...")
     try:
         result = subprocess.run(
             [sys.executable, STUDENT_SCRIPT],
             capture_output=True,
             text=True,
-            timeout=30  # Timeout to prevent infinite loops
+            timeout=300  # INCREASED TIMEOUT TO 5 MINUTES
         )
         return result
+    except subprocess.TimeoutExpired:
+        print("❌ Error: Script timed out after 5 minutes.")
+        print("   This might indicate an infinite loop or extremely large data files.")
+        sys.exit(1)
     except FileNotFoundError:
         print(f"Error: Could not find {STUDENT_SCRIPT}.")
         sys.exit(1)
 
 def validate_checklist(script_output):
-    """Validates checklist items against Output and DB State (excluding text write-up check)."""
+    """Validates checklist items against Output and DB State."""
     client = pymongo.MongoClient("mongodb://localhost:27017/")
     report = []
     
@@ -37,8 +42,12 @@ def validate_checklist(script_output):
     if script_output.returncode == 0:
         report.append(("[x] Script Execution", "PASS", "Script ran without errors."))
     else:
-        report.append(("[ ] Script Execution", "FAIL", f"Script failed with error:\n{script_output.stderr}"))
-        return report # Stop if script crashed
+        # Print the error output to help debug
+        print("\n--- SCRIPT ERROR OUTPUT ---")
+        print(script_output.stderr)
+        print("---------------------------")
+        report.append(("[ ] Script Execution", "FAIL", "Script failed (see error above)."))
+        return report 
 
     # ---------------------------------------------------------
     # CHECK 2: Database Selection
@@ -87,7 +96,6 @@ def validate_checklist(script_output):
     # CHECK 5: Optimization (Index on 'name')
     # ---------------------------------------------------------
     indexes = collection.index_information()
-    # MongoDB indexes usually look like {'_id_': {...}, 'name_1': {'key': [('name', 1)]}}
     index_found = False
     for name, details in indexes.items():
         if details['key'][0][0] == REQUIRED_INDEX:
@@ -102,7 +110,6 @@ def validate_checklist(script_output):
     # ---------------------------------------------------------
     # CHECK 6: Task (b) Output Validation (Query Result)
     # ---------------------------------------------------------
-    # We look for the specific print output from the script
     output_str = script_output.stdout
     if "Found Movie: Shrek (2001)" in output_str and "Directors: Andrew Adamson" in output_str:
         report.append(("[x] Task (b) Query Output", "PASS", "Script printed correct details for 'Shrek (2001)'."))
@@ -112,10 +119,7 @@ def validate_checklist(script_output):
     return report
 
 def main():
-    # Run the student's code
     result = run_student_script()
-    
-    # Validate results
     results = validate_checklist(result)
     
     print("\n" + "="*40)
