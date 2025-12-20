@@ -1,6 +1,7 @@
 from pyspark import SparkContext, SparkConf
 import sys
 import os
+import shutil
 
 def main():
     """
@@ -17,24 +18,23 @@ def main():
     # ==========================================
     INPUT_FILE = "pagerank_input.txt"  # Default input file
     OUTPUT_FILE = "pagerank_output.txt"  # Default output file
-    NUM_ITERATIONS = 10  # Number of iterations (k=10 as specified)
+    NUM_ITERATIONS = 10  # Number of iterations
     
-    # Allow command line arguments for input/output files
     if len(sys.argv) > 1:
         INPUT_FILE = sys.argv[1]
     if len(sys.argv) > 2:
         OUTPUT_FILE = sys.argv[2]
     
     # ==========================================
-    # INITIALIZE SPARK (Windows-optimized)
+    # INITIALIZE SPARK
     # ==========================================
     conf = (SparkConf()
             .setAppName("PageRank")
-            .setMaster("local[1]")  # Use only 1 thread to avoid connection issues
+            .setMaster("local[1]")
             .set("spark.driver.host", "localhost")
             .set("spark.driver.bindAddress", "127.0.0.1")
-            .set("spark.ui.enabled", "false")  # Disable UI
-            .set("spark.sql.shuffle.partitions", "1"))  # Minimal shuffling
+            .set("spark.ui.enabled", "false")
+            .set("spark.sql.shuffle.partitions", "1"))
     
     try:
         sc = SparkContext(conf=conf)
@@ -57,11 +57,11 @@ def main():
         sc.stop()
         sys.exit(1)
     
-    # Parse edges: (source, destination) - NO CACHE to avoid serialization issues
+    # Parse edges: (source, destination)
     edges = lines.map(lambda line: tuple(line.strip().split()))
     
-    # Get all unique vertices - collect early to avoid issues
-    edges_list = edges.collect()  # Collect to driver to avoid Java communication issues
+    # Collect to driver to fix dangling nodes
+    edges_list = edges.collect()
     
     all_vertices_set = set()
     for src, dst in edges_list:
@@ -74,14 +74,13 @@ def main():
     print(f"🔢 Total vertices in graph: {num_vertices}")
     print(f"   Vertices: {all_vertices}")
     
-    # Build adjacency list in Python (not Spark) to avoid issues
+    # Build adjacency list locally
     adjacency_dict = {v: [] for v in all_vertices}
     for src, dst in edges_list:
         adjacency_dict[src].append(dst)
     
-    # For vertices with no outgoing edges, add edges to all OTHER vertices
+    # FIX DANGLING NODES: Connect them to all other vertices
     vertices_with_no_edges = [v for v in all_vertices if len(adjacency_dict[v]) == 0]
-    
     print(f"🔍 Vertices with no outgoing edges: {vertices_with_no_edges}")
     
     for vertex in vertices_with_no_edges:
@@ -93,7 +92,7 @@ def main():
     # ==========================================
     # STEP 1: INITIALIZE PAGE RANKS
     # ==========================================
-    
+    # Initialize ranks to 1.0 (Sum of ranks = N)
     ranks = sc.parallelize([(vertex, 1.0) for vertex in all_vertices])
     
     print(f"\n🚀 Starting PageRank algorithm with {NUM_ITERATIONS} iterations...")
@@ -106,7 +105,7 @@ def main():
         # Join ranks with adjacency list
         ranks_with_neighbors = adjacency_list.join(ranks)
         
-        # Calculate contributions
+        # Calculate contributions (Handles 5% Stay and 85% Link)
         contributions = ranks_with_neighbors.flatMap(
             lambda vertex_data: compute_contributions(vertex_data, num_vertices)
         )
@@ -115,11 +114,10 @@ def main():
         summed_contributions = contributions.reduceByKey(lambda a, b: a + b)
         
         # Update ranks
-        ranks = summed_contributions.mapValues(lambda contrib: 0.15 + 0.85 * contrib)
-        
-        # Ensure all vertices have ranks
-        all_vertices_with_base = sc.parallelize([(v, 0.15) for v in all_vertices])
-        ranks = ranks.union(all_vertices_with_base).reduceByKey(lambda a, b: a if a != 0.15 else b)
+        # FIX: Add the missing 10% Teleportation mass.
+        # Since 'compute_contributions' calculates 90% of the mass,
+        # we add 0.10 (which is 10% of 1.0) to represent the random jumps.
+        ranks = summed_contributions.mapValues(lambda contrib: 0.10 + contrib)
         
         if (iteration + 1) % 5 == 0:
             print(f"   Iteration {iteration + 1}/{NUM_ITERATIONS} complete")
@@ -128,6 +126,7 @@ def main():
     # STEP 5: NORMALIZE BY TOTAL NUMBER OF VERTICES
     # ==========================================
     
+    # Normalize so total sum is 1.0
     final_ranks = ranks.mapValues(lambda rank: rank / num_vertices)
     
     # Collect results to driver
@@ -146,8 +145,7 @@ def main():
     output_lines = [f"{vertex} {rank}" for vertex, rank in final_ranks_sorted]
     output_rdd = sc.parallelize(output_lines, 1)  # Single partition
     
-    # Remove output directory if it exists
-    import shutil
+    # Clean up output directory
     if os.path.exists(OUTPUT_FILE):
         if os.path.isdir(OUTPUT_FILE):
             shutil.rmtree(OUTPUT_FILE)
@@ -159,7 +157,6 @@ def main():
     print(f"\n💾 Results saved to: {OUTPUT_FILE}")
     print(f"   (Output is in a directory - check {OUTPUT_FILE}/part-00000)")
     
-    # Stop Spark context
     sc.stop()
 
 
@@ -167,17 +164,9 @@ def compute_contributions(vertex_data, num_vertices):
     """
     Compute contributions from a vertex to its neighbors.
     
-    Args:
-        vertex_data: Tuple of (vertex, (neighbors_list, rank))
-        num_vertices: Total number of vertices in the graph
-    
-    Returns:
-        List of (target_vertex, contribution) tuples
-    
-    The random surfer model:
-    - 5% chance to stay on current page (self-loop)
-    - 85% chance to follow a link (distributed among neighbors)
-    - 10% chance to randomly teleport (handled separately, not per-vertex)
+    Includes:
+    - 5% Stay (Self-loop)
+    - 85% Link (Distributed to neighbors)
     """
     vertex, (neighbors, rank) = vertex_data
     contributions = []
@@ -193,15 +182,7 @@ def compute_contributions(vertex_data, num_vertices):
         contribution_per_neighbor = (0.85 * rank) / num_neighbors
         for neighbor in neighbors:
             contributions.append((neighbor, contribution_per_neighbor))
-    
-    # Contribution 3: Random teleport (10% of ALL ranks distributed to ALL vertices)
-    # This is handled implicitly in the rank update formula:
-    # The 0.15 in "0.15 + 0.85 × contributions" accounts for:
-    # - 0.10 from random teleport (distributed from all vertices)
-    # - 0.05 from self-loop (already added above)
-    # Since sum of all ranks is num_vertices (each initialized to 1.0),
-    # each vertex gets 0.10 * num_vertices / num_vertices = 0.10 from teleport
-    
+            
     return contributions
 
 
