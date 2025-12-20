@@ -16,16 +16,16 @@ def run_student_script():
     print(f"Running {STUDENT_SCRIPT}...")
     print("⏳ This may take a minute or two depending on your computer's speed...")
     try:
+        # TIMEOUT SET TO 5 MINUTES
         result = subprocess.run(
             [sys.executable, STUDENT_SCRIPT],
             capture_output=True,
             text=True,
-            timeout=300  # INCREASED TIMEOUT TO 5 MINUTES
+            timeout=300  
         )
         return result
     except subprocess.TimeoutExpired:
         print("❌ Error: Script timed out after 5 minutes.")
-        print("   This might indicate an infinite loop or extremely large data files.")
         sys.exit(1)
     except FileNotFoundError:
         print(f"Error: Could not find {STUDENT_SCRIPT}.")
@@ -37,16 +37,14 @@ def validate_checklist(script_output):
     report = []
     
     # ---------------------------------------------------------
-    # CHECK 1: Library Usage & Script Execution
+    # CHECK 1: Script Execution
     # ---------------------------------------------------------
     if script_output.returncode == 0:
         report.append(("[x] Script Execution", "PASS", "Script ran without errors."))
     else:
-        # Print the error output to help debug
         print("\n--- SCRIPT ERROR OUTPUT ---")
         print(script_output.stderr)
-        print("---------------------------")
-        report.append(("[ ] Script Execution", "FAIL", "Script failed (see error above)."))
+        report.append(("[ ] Script Execution", "FAIL", "Script failed."))
         return report 
 
     # ---------------------------------------------------------
@@ -61,7 +59,7 @@ def validate_checklist(script_output):
     db = client[DB_NAME]
     
     # ---------------------------------------------------------
-    # CHECK 3: Data Storage Model (Single Collection + Embedding)
+    # CHECK 3: Collection Creation
     # ---------------------------------------------------------
     if COLLECTION_NAME in db.list_collection_names():
         report.append(("[x] Collection Creation", "PASS", f"Collection '{COLLECTION_NAME}' exists."))
@@ -70,21 +68,31 @@ def validate_checklist(script_output):
         return report
 
     collection = db[COLLECTION_NAME]
-    sample_doc = collection.find_one({ "cast": { "$exists": True } })
-
-    if sample_doc:
-        has_cast = isinstance(sample_doc.get('cast'), list) and len(sample_doc['cast']) > 0
-        has_directors = isinstance(sample_doc.get('directors'), list)
-        
-        if has_cast and has_directors:
-             report.append(("[x] Data Storage Model", "PASS", "Document contains embedded 'cast' and 'directors' arrays."))
-        else:
-             report.append(("[ ] Data Storage Model", "FAIL", "Documents do not have expected embedded arrays."))
-    else:
-        report.append(("[ ] Data Storage Model", "FAIL", "No documents found to verify embedding."))
 
     # ---------------------------------------------------------
-    # CHECK 4: File Parsing (Data Volume)
+    # CHECK 4: Data Storage Model (Single Collection + Embedding)
+    # ---------------------------------------------------------
+    # IMPROVED CHECK: Find a movie that definitely has cast members (like Shrek)
+    # instead of a random one that might be empty.
+    sample_doc = collection.find_one({"name": "Shrek (2001)"})
+
+    if sample_doc:
+        # Check if 'cast' and 'directors' keys exist and are lists
+        is_cast_list = isinstance(sample_doc.get('cast'), list)
+        is_dir_list = isinstance(sample_doc.get('directors'), list)
+        
+        # Check if they actually contain data (since Shrek should)
+        has_cast_data = len(sample_doc.get('cast', [])) > 0
+        
+        if is_cast_list and is_dir_list and has_cast_data:
+             report.append(("[x] Data Storage Model", "PASS", "Document contains correctly embedded 'cast' and 'directors' arrays."))
+        else:
+             report.append(("[ ] Data Storage Model", "FAIL", "Embedded arrays are missing or empty in 'Shrek (2001)'."))
+    else:
+        report.append(("[ ] Data Storage Model", "FAIL", "Could not find 'Shrek (2001)' to verify model."))
+
+    # ---------------------------------------------------------
+    # CHECK 5: File Parsing (Data Volume)
     # ---------------------------------------------------------
     count = collection.count_documents({})
     if count > 0:
@@ -93,7 +101,7 @@ def validate_checklist(script_output):
         report.append(("[ ] File Parsing", "FAIL", "Collection is empty."))
 
     # ---------------------------------------------------------
-    # CHECK 5: Optimization (Index on 'name')
+    # CHECK 6: Optimization (Index on 'name')
     # ---------------------------------------------------------
     indexes = collection.index_information()
     index_found = False
@@ -108,7 +116,7 @@ def validate_checklist(script_output):
         report.append(("[ ] Optimization", "FAIL", f"Index on '{REQUIRED_INDEX}' NOT found."))
 
     # ---------------------------------------------------------
-    # CHECK 6: Task (b) Output Validation (Query Result)
+    # CHECK 7: Task (b) Output Validation (Query Result)
     # ---------------------------------------------------------
     output_str = script_output.stdout
     if "Found Movie: Shrek (2001)" in output_str and "Directors: Andrew Adamson" in output_str:
